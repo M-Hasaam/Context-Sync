@@ -99,13 +99,53 @@ function scrapeCurrentConversation() {
   const messages = [];
   const now = new Date().toISOString();
 
-  document.querySelectorAll("[data-message-author-role]").forEach(el => {
-    const role = el.getAttribute("data-message-author-role");
-    const type = role === "user" ? "user" : "assistant";
-    const contentEl = el.querySelector(".whitespace-pre-wrap, .markdown, [data-message-content]");
-    const content = (contentEl || el).innerText?.trim();
-    if (content) messages.push({ type, content, format: "text", timestamp: now });
+  // 1. Classic ChatGPT UI (data-message-author-role)
+  const classicEls = document.querySelectorAll("[data-message-author-role]");
+  if (classicEls.length > 0) {
+    classicEls.forEach(el => {
+      const role = el.getAttribute("data-message-author-role");
+      const type = role === "user" ? "user" : "assistant";
+      const contentEl = el.querySelector(".whitespace-pre-wrap, .markdown, [data-message-content]");
+      const content = (contentEl || el).innerText?.trim();
+      if (content) messages.push({ type, content, format: "text", timestamp: now });
+    });
+    if (messages.length > 0) return messages;
+  }
+
+  // 2. Modern 2025/2026 ChatGPT UI
+  const userBtns = document.querySelectorAll(
+    'button[aria-label*="Edit message" i], button[aria-label*="Share prompt" i], button[aria-label*="Copy message" i]'
+  );
+  const assistantRoots = document.querySelectorAll('[class*="DilResponseRoot"], .markdown');
+
+  const elements = [];
+  userBtns.forEach(btn => {
+    const group = btn.closest('div.group, [class*="turn"]');
+    const bubble = group?.querySelector('.whitespace-pre-wrap, div[dir="auto"], [class*="user"]') || group;
+    if (bubble && !elements.some(e => e.el === bubble)) {
+      elements.push({ el: bubble, type: "user" });
+    }
   });
+
+  assistantRoots.forEach(root => {
+    if (!elements.some(e => e.el === root) && !root.closest('button[aria-label*="Edit message" i]')) {
+      elements.push({ el: root, type: "assistant" });
+    }
+  });
+
+  elements.sort((a, b) =>
+    a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+  );
+
+  for (const { el, type } of elements) {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('button, svg, [aria-hidden="true"]').forEach(n => n.remove());
+    let text = clone.innerText?.trim();
+    if (text) {
+      text = text.replace(/^You said:\s*/i, "").replace(/^ChatGPT said:\s*/i, "").trim();
+      messages.push({ type, content: text, format: "text", timestamp: now });
+    }
+  }
 
   return messages;
 }
@@ -230,21 +270,23 @@ function ensureStyles() {
       align-items: center !important;
       gap: 5px !important;
       padding: 0 10px !important;
-      height: 32px !important;
+      height: 28px !important;
       background: transparent !important;
       border: 1px solid rgba(255,255,255,0.15) !important;
       border-radius: 8px !important;
-      color: rgba(255,255,255,0.65) !important;
+      color: rgba(255,255,255,0.75) !important;
       cursor: pointer !important;
       font-family: system-ui, sans-serif !important;
       font-size: 12px !important;
-      font-weight: 600 !important;
+      font-weight: 500 !important;
       transition: background 0.15s, border-color 0.15s, color 0.15s !important;
       flex-shrink: 0 !important;
       white-space: nowrap !important;
       outline: none !important;
       box-shadow: none !important;
       vertical-align: middle !important;
+      align-self: center !important;
+      margin: 0 4px !important;
     }
     #cc-ask-ai-btn:hover {
       background: rgba(255,255,255,0.07) !important;
@@ -481,37 +523,46 @@ function createAskAIButton() {
 
 // ChatGPT toolbar injection
 function findChatGPTSlot() {
-  const plusBtn = document.querySelector('button[data-testid="composer-plus-btn"]');
+  const plusBtn = document.querySelector(
+    'button[aria-label*="Add files" i], ' +
+    'button[data-testid="composer-plus-btn"], ' +
+    'button[aria-label*="Attach" i], ' +
+    'button[data-testid*="attach" i], ' +
+    'button[data-testid*="plus" i]'
+  );
   if (!plusBtn) return null;
   return plusBtn.closest("span") || plusBtn.parentElement;
 }
 
 function injectChatGPTButton() {
   if (document.getElementById("cc-ask-ai-btn")) return;
-  ensureStyles();
   const slot = findChatGPTSlot();
   if (!slot) return;
+  ensureStyles();
 
   const btn = createAskAIButton();
   slot.parentElement?.insertBefore(btn, slot.nextSibling) || slot.parentElement?.appendChild(btn);
 }
 
-// BLOCK D — Keep button alive
+// BLOCK D — Keep button alive & auto-save
 let _chatgptObserver = null;
 function watchForButtonRemoval() {
   if (_chatgptObserver) return;
-  _chatgptObserver = new MutationObserver(() => {
+  _chatgptObserver = new MutationObserver((mutations) => {
     if (!document.getElementById("cc-ask-ai-btn")) {
-      setTimeout(injectChatGPTButton, 300);
+      injectChatGPTButton();
+    }
+    if (mutations.some(m => m.addedNodes.length > 0 || m.type === "characterData")) {
+      scheduleConversationSave();
     }
   });
-  _chatgptObserver.observe(document.body, { childList: true, subtree: true });
+  _chatgptObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 }
 
 let _injectAttempts = 0;
 function retryInjectButton() {
   if (document.getElementById("cc-ask-ai-btn")) { watchForButtonRemoval(); return; }
-  if (_injectAttempts++ > 30) return;
+  if (_injectAttempts++ > 30) { watchForButtonRemoval(); return; }
   injectChatGPTButton();
   if (!document.getElementById("cc-ask-ai-btn")) {
     setTimeout(retryInjectButton, 500);
@@ -522,6 +573,14 @@ function retryInjectButton() {
 
 // BLOCK E — Auto-save for popup display
 const CC_STORAGE_KEY = "claude_conversations";
+let _debounceTimer = null;
+
+function scheduleConversationSave() {
+  clearTimeout(_debounceTimer);
+  _debounceTimer = setTimeout(() => {
+    scrapeAndSave();
+  }, 1000);
+}
 
 function scrapeAndSave() {
   const messages = scrapeCurrentConversation();
@@ -554,6 +613,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 function init() {
   tryInjectContext();
   retryInjectButton();
+  watchForButtonRemoval();
+
+  setTimeout(scheduleConversationSave, 1500);
+  setTimeout(scheduleConversationSave, 3500);
 }
 
 if (document.readyState === "loading") {
