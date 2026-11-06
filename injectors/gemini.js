@@ -221,6 +221,9 @@ function scrapeCurrentConversation() {
             .join("\n") || queryTextEl.innerText?.trim()
           : el.querySelector(".user-query-bubble-with-background")?.innerText?.trim()
           || el.innerText?.trim();
+        if (text) {
+          text = text.replace(/^You said\s*/i, "").trim();
+        }
       } else {
         // Confirmed: message-content .markdown.markdown-main-panel
         const markdownEl =
@@ -236,6 +239,9 @@ function scrapeCurrentConversation() {
           const clone = el.cloneNode(true);
           clone.querySelectorAll("button, svg, [aria-hidden], response-element, sources-list, message-actions").forEach(n => n.remove());
           text = clone.innerText?.trim();
+        }
+        if (text) {
+          text = text.replace(/^Gemini said\s*/i, "").trim();
         }
       }
       if (text) messages.push({ type, content: text, format: "text", timestamp: now });
@@ -364,14 +370,15 @@ function ensureStyles() {
   s.textContent = `
     #cc-ask-ai-btn {
       display: inline-flex !important; align-items: center !important; gap: 5px !important;
-      padding: 0 10px !important; height: 32px !important;
+      padding: 0 10px !important; height: 28px !important;
       background: transparent !important; border: 1px solid rgba(255,255,255,0.15) !important;
-      border-radius: 8px !important; color: rgba(255,255,255,0.65) !important;
+      border-radius: 8px !important; color: rgba(255,255,255,0.75) !important;
       cursor: pointer !important; font-family: system-ui, sans-serif !important;
-      font-size: 12px !important; font-weight: 600 !important;
+      font-size: 12px !important; font-weight: 500 !important;
       transition: background 0.15s, border-color 0.15s, color 0.15s !important;
       flex-shrink: 0 !important; white-space: nowrap !important;
       outline: none !important; box-shadow: none !important; vertical-align: middle !important;
+      align-self: center !important; margin: 0 4px !important;
     }
     #cc-ask-ai-btn:hover {
       background: rgba(255,255,255,0.07) !important;
@@ -574,7 +581,6 @@ function createAskAIButton() {
     </svg>
     Export
   `;
-  btn.style.marginBottom = "5px";
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     _panelOpen ? closePanel() : openPanel(btn);
@@ -590,34 +596,44 @@ function createAskAIButton() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function findGeminiSlot() {
-  return document.querySelector(".leading-actions-wrapper") || null;
+  return (
+    document.querySelector(".text-input-field .leading-actions-wrapper") ||
+    document.querySelector(".leading-actions-wrapper") ||
+    document.querySelector(".text-input-field .trailing-actions-wrapper") ||
+    document.querySelector(".trailing-actions-wrapper") ||
+    null
+  );
 }
 
 function injectGeminiButton() {
   if (document.getElementById("cc-ask-ai-btn")) return;
-  ensureStyles();
   const slot = findGeminiSlot();
   if (!slot) return;
+  ensureStyles();
   const btn = createAskAIButton();
-  const toolbox = slot.querySelector("toolbox-drawer");
-  toolbox ? slot.insertBefore(btn, toolbox) : slot.appendChild(btn);
+  slot.appendChild(btn);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BLOCK H — MutationObserver to survive Angular re-renders
+// BLOCK H — MutationObserver to survive Angular re-renders & auto-save
 // ═══════════════════════════════════════════════════════════════════════════════
 
+let _geminiObserver = null;
 function observeGeminiDOM() {
-  const observer = new MutationObserver(() => {
+  if (_geminiObserver) return;
+  _geminiObserver = new MutationObserver((mutations) => {
     if (!document.getElementById("cc-ask-ai-btn")) injectGeminiButton();
+    if (mutations.some(m => m.addedNodes.length > 0 || m.type === "characterData")) {
+      scheduleConversationSave();
+    }
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  _geminiObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
 }
 
 let _injectAttempts = 0;
 function retryInjectButton() {
   if (document.getElementById("cc-ask-ai-btn")) { observeGeminiDOM(); return; }
-  if (_injectAttempts++ > 30) return;
+  if (_injectAttempts++ > 30) { observeGeminiDOM(); return; }
   injectGeminiButton();
   if (!document.getElementById("cc-ask-ai-btn")) {
     setTimeout(retryInjectButton, 500);
@@ -631,6 +647,14 @@ function retryInjectButton() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const CC_STORAGE_KEY = "claude_conversations";
+let _debounceTimer = null;
+
+function scheduleConversationSave() {
+  clearTimeout(_debounceTimer);
+  _debounceTimer = setTimeout(() => {
+    scrapeAndSave();
+  }, 1000);
+}
 
 function scrapeAndSave() {
   const messages = scrapeCurrentConversation();
@@ -674,6 +698,11 @@ function init() {
   setTimeout(tryInjectContext, 3000);
 
   retryInjectButton();
+  observeGeminiDOM();
+
+  // Auto-save on page load after chat loads
+  setTimeout(scheduleConversationSave, 1500);
+  setTimeout(scheduleConversationSave, 3500);
 }
 
 if (document.readyState === "loading") {
